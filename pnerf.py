@@ -8,8 +8,9 @@ __copyright__ = "Copyright 2018, Harvard Medical School"
 __license__ = "MIT"
 
 # Imports
-import numpy as np
-import tensorflow as tf
+import jax.numpy as np
+from jax.ops import index_update
+from jax.lax import fori_loop
 import collections
 
 # Constants
@@ -18,7 +19,13 @@ NUM_DIHEDRALS = 3
 BOND_LENGTHS = np.array([145.801, 152.326, 132.868], dtype='float32')
 BOND_ANGLES  = np.array([  2.124,   1.941,   2.028], dtype='float32')
 
-def dihedral_to_point(dihedral, r=BOND_LENGTHS, theta=BOND_ANGLES, name=None):
+def normalize(v, axis=-1, order=2):
+    # From .https://stackoverflow.com/questions/21030391/how-to-normalize-an-array-in-numpy
+    norm = np.atleast_1d(np.linalg.norm(v, order, axis))
+    return v / np.expand_dims(norm, axis)
+
+
+def dihedral_to_point(dihedral, r=BOND_LENGTHS, theta=BOND_ANGLES):
     """ Takes triplets of dihedral angles (phi, psi, omega) and returns 3D points ready for use in
         reconstruction of coordinates. Bond lengths and angles are based on idealized averages.
 
@@ -28,28 +35,23 @@ def dihedral_to_point(dihedral, r=BOND_LENGTHS, theta=BOND_ANGLES, name=None):
     Returns:
                   [NUM_STEPS x NUM_DIHEDRALS, BATCH_SIZE, NUM_DIMENSIONS]
     """
+    num_steps  = dihedral.shape[0]
+    batch_size = dihedral.shape[1]
 
-    with tf.name_scope(name, 'dihedral_to_point', [dihedral]) as scope:
-        dihedral = tf.convert_to_tensor(dihedral, name='dihedral') # [NUM_STEPS, BATCH_SIZE, NUM_DIHEDRALS]
+    r_cos_theta = r * np.cos(np.pi - theta) # [NUM_DIHEDRALS]
+    r_sin_theta = r * np.sin(np.pi - theta) # [NUM_DIHEDRALS]
 
-        num_steps  = tf.shape(dihedral)[0]
-        batch_size = dihedral.get_shape().as_list()[1] # important to use get_shape() to keep batch_size fixed for performance reasons
+    pt_x = np.tile(np.reshape(r_cos_theta, [1, 1, -1]), [num_steps, batch_size, 1]) # [NUM_STEPS, BATCH_SIZE, NUM_DIHEDRALS]
+    pt_y = np.cos(dihedral) * r_sin_theta  # [NUM_STEPS, BATCH_SIZE, NUM_DIHEDRALS]
+    pt_z = np.sin(dihedral) * r_sin_theta # [NUM_STEPS, BATCH_SIZE, NUM_DIHEDRALS]
 
-        r_cos_theta = tf.constant(r * np.cos(np.pi - theta), name='r_cos_theta') # [NUM_DIHEDRALS]
-        r_sin_theta = tf.constant(r * np.sin(np.pi - theta), name='r_sin_theta') # [NUM_DIHEDRALS]
+    pt = np.stack([pt_x, pt_y, pt_z]) # [NUM_DIMS, NUM_STEPS, BATCH_SIZE, NUM_DIHEDRALS]
+    pt_perm = np.transpose(pt) # [NUM_STEPS, NUM_DIHEDRALS, BATCH_SIZE, NUM_DIMS]
+    pt_final = np.reshape(pt_perm, [num_steps * NUM_DIHEDRALS, batch_size, NUM_DIMENSIONS]) # [NUM_STEPS x NUM_DIHEDRALS, BATCH_SIZE, NUM_DIMS]
 
-        pt_x = tf.tile(tf.reshape(r_cos_theta, [1, 1, -1]), [num_steps, batch_size, 1], name='pt_x') # [NUM_STEPS, BATCH_SIZE, NUM_DIHEDRALS]
-        pt_y = tf.multiply(tf.cos(dihedral), r_sin_theta,                               name='pt_y') # [NUM_STEPS, BATCH_SIZE, NUM_DIHEDRALS]
-        pt_z = tf.multiply(tf.sin(dihedral), r_sin_theta,                               name='pt_z') # [NUM_STEPS, BATCH_SIZE, NUM_DIHEDRALS]
+    return pt_final
 
-        pt = tf.stack([pt_x, pt_y, pt_z])                                                       # [NUM_DIMS, NUM_STEPS, BATCH_SIZE, NUM_DIHEDRALS]
-        pt_perm = tf.transpose(pt, perm=[1, 3, 2, 0])                                           # [NUM_STEPS, NUM_DIHEDRALS, BATCH_SIZE, NUM_DIMS]
-        pt_final = tf.reshape(pt_perm, [num_steps * NUM_DIHEDRALS, batch_size, NUM_DIMENSIONS], # [NUM_STEPS x NUM_DIHEDRALS, BATCH_SIZE, NUM_DIMS]
-                              name=scope) 
-
-        return pt_final
-
-def point_to_coordinate(pt, num_fragments=6, parallel_iterations=4, swap_memory=False, name=None):
+def point_to_coordinate(pt, num_fragments=6):
     """ Takes points from dihedral_to_point and sequentially converts them into the coordinates of a 3D structure.
 
         Reconstruction is done in parallel, by independently reconstructing num_fragments fragments and then 
@@ -67,75 +69,69 @@ def point_to_coordinate(pt, num_fragments=6, parallel_iterations=4, swap_memory=
             [NUM_STEPS x NUM_DIHEDRALS, BATCH_SIZE, NUM_DIMENSIONS] 
     """                             
 
-    with tf.name_scope(name, 'point_to_coordinate', [pt]) as scope:
-        pt = tf.convert_to_tensor(pt, name='pt')
+    # compute optimal number of fragments if needed
+    s = pt.shape[0] # NUM_STEPS x NUM_DIHEDRALS
+    if num_fragments is None:
+        num_fragments = np.cast(np.sqrt(np.cast(s, dtype='float32')), dtype='int32')
 
-        # compute optimal number of fragments if needed
-        s = tf.shape(pt)[0] # NUM_STEPS x NUM_DIHEDRALS
-        if num_fragments is None: num_fragments = tf.cast(tf.sqrt(tf.cast(s, dtype=tf.float32)), dtype=tf.int32)
+    # initial three coordinates (specifically chosen to eliminate need for extraneous matmul)
+    Triplet = collections.namedtuple('Triplet', 'a, b, c')
+    batch_size = pt.shape[1] # BATCH_SIZE
+    init_mat = np.array([[-np.sqrt(1.0 / 2.0), np.sqrt(3.0 / 2.0), 0], [-np.sqrt(2.0), 0, 0], [0, 0, 0]], dtype='float32')
+    init_coords = Triplet(*[np.reshape(np.tile(row[np.newaxis], np.stack([num_fragments * batch_size, 1])), 
+                                       [num_fragments, batch_size, NUM_DIMENSIONS]) for row in init_mat])
+                  # NUM_DIHEDRALS x [NUM_FRAGS, BATCH_SIZE, NUM_DIMENSIONS] 
+    
+    # pad points to yield equal-sized fragments
+    r = ((num_fragments - (s % num_fragments)) % num_fragments)          # (NUM_FRAGS x FRAG_SIZE) - (NUM_STEPS x NUM_DIHEDRALS)
+    pt = np.pad(pt, [[0, r], [0, 0], [0, 0]])                            # [NUM_FRAGS x FRAG_SIZE, BATCH_SIZE, NUM_DIMENSIONS]
+    pt = np.reshape(pt, [num_fragments, -1, batch_size, NUM_DIMENSIONS]) # [NUM_FRAGS, FRAG_SIZE,  BATCH_SIZE, NUM_DIMENSIONS]
+    pt = np.transpose(pt, [1, 0, 2, 3])                                  # [FRAG_SIZE, NUM_FRAGS,  BATCH_SIZE, NUM_DIMENSIONS]
 
-        # initial three coordinates (specifically chosen to eliminate need for extraneous matmul)
-        Triplet = collections.namedtuple('Triplet', 'a, b, c')
-        batch_size = pt.get_shape().as_list()[1] # BATCH_SIZE
-        init_mat = np.array([[-np.sqrt(1.0 / 2.0), np.sqrt(3.0 / 2.0), 0], [-np.sqrt(2.0), 0, 0], [0, 0, 0]], dtype='float32')
-        init_coords = Triplet(*[tf.reshape(tf.tile(row[np.newaxis], tf.stack([num_fragments * batch_size, 1])), 
-                                           [num_fragments, batch_size, NUM_DIMENSIONS]) for row in init_mat])
-                      # NUM_DIHEDRALS x [NUM_FRAGS, BATCH_SIZE, NUM_DIMENSIONS] 
-        
-        # pad points to yield equal-sized fragments
-        r = ((num_fragments - (s % num_fragments)) % num_fragments)          # (NUM_FRAGS x FRAG_SIZE) - (NUM_STEPS x NUM_DIHEDRALS)
-        pt = tf.pad(pt, [[0, r], [0, 0], [0, 0]])                            # [NUM_FRAGS x FRAG_SIZE, BATCH_SIZE, NUM_DIMENSIONS]
-        pt = tf.reshape(pt, [num_fragments, -1, batch_size, NUM_DIMENSIONS]) # [NUM_FRAGS, FRAG_SIZE,  BATCH_SIZE, NUM_DIMENSIONS]
-        pt = tf.transpose(pt, perm=[1, 0, 2, 3])                             # [FRAG_SIZE, NUM_FRAGS,  BATCH_SIZE, NUM_DIMENSIONS]
+    # extension function used for single atom reconstruction and whole fragment alignment
+    def extend(tri, pt, multi_m):
+        """
+        Args:
+            tri: NUM_DIHEDRALS x [NUM_FRAGS/0,         BATCH_SIZE, NUM_DIMENSIONS]
+            pt:                  [NUM_FRAGS/FRAG_SIZE, BATCH_SIZE, NUM_DIMENSIONS]
+            multi_m: bool indicating whether m (and tri) is higher rank. pt is always higher rank; what changes is what the first rank is.
+        """
 
-        # extension function used for single atom reconstruction and whole fragment alignment
-        def extend(tri, pt, multi_m):
-            """
-            Args:
-                tri: NUM_DIHEDRALS x [NUM_FRAGS/0,         BATCH_SIZE, NUM_DIMENSIONS]
-                pt:                  [NUM_FRAGS/FRAG_SIZE, BATCH_SIZE, NUM_DIMENSIONS]
-                multi_m: bool indicating whether m (and tri) is higher rank. pt is always higher rank; what changes is what the first rank is.
-            """
+        bc = normalize(tri.c - tri.b, axis=-1)                                        # [NUM_FRAGS/0, BATCH_SIZE, NUM_DIMS]        
+        n = normalize(np.cross(tri.b - tri.a, bc), axis=-1)                            # [NUM_FRAGS/0, BATCH_SIZE, NUM_DIMS]
+        if multi_m: # multiple fragments, one atom at a time. 
+            m = np.transpose(np.stack([bc, np.cross(n, bc), n]), perm=[1, 2, 3, 0])        # [NUM_FRAGS,   BATCH_SIZE, NUM_DIMS, 3 TRANS]
+        else: # single fragment, reconstructed entirely at once.
+            s = np.pad(pt.shape, [[0, 1]], constant_values=3)                                    # FRAG_SIZE, BATCH_SIZE, NUM_DIMS, 3 TRANS
+            m = np.transpose(np.stack([bc, np.cross(n, bc), n]), perm=[1, 2, 0])                     # [BATCH_SIZE, NUM_DIMS, 3 TRANS]
+            m = np.reshape(np.tile(m, [s[0], 1, 1]), s)                                    # [FRAG_SIZE, BATCH_SIZE, NUM_DIMS, 3 TRANS]
+        coord = np.squeeze(np.matmul(m, np.expand_dims(pt, 3)), axis=3) + tri.c  # [NUM_FRAGS/FRAG_SIZE, BATCH_SIZE, NUM_DIMS]
+        return coord
+    
+    # loop over FRAG_SIZE in NUM_FRAGS parallel fragments, sequentially generating the coordinates for each fragment across all batches
+    coords = np.zeros_like(pt)  # FRAG_SIZE x [NUM_FRAGS, BATCH_SIZE, NUM_DIMENSIONS] 
+    
+    def loop_extend(i, dt): # FRAG_SIZE x [NUM_FRAGS, BATCH_SIZE, NUM_DIMENSIONS] 
+        tri, coords = dt
+        coord = extend(tri, pt[i], True)
+        return (Triplet(tri.b, tri.c, coord), index_update(coords, i, coord))
 
-            bc = tf.nn.l2_normalize(tri.c - tri.b, -1, name='bc')                                        # [NUM_FRAGS/0, BATCH_SIZE, NUM_DIMS]        
-            n = tf.nn.l2_normalize(tf.cross(tri.b - tri.a, bc), -1, name='n')                            # [NUM_FRAGS/0, BATCH_SIZE, NUM_DIMS]
-            if multi_m: # multiple fragments, one atom at a time. 
-                m = tf.transpose(tf.stack([bc, tf.cross(n, bc), n]), perm=[1, 2, 3, 0], name='m')        # [NUM_FRAGS,   BATCH_SIZE, NUM_DIMS, 3 TRANS]
-            else: # single fragment, reconstructed entirely at once.
-                s = tf.pad(tf.shape(pt), [[0, 1]], constant_values=3)                                    # FRAG_SIZE, BATCH_SIZE, NUM_DIMS, 3 TRANS
-                m = tf.transpose(tf.stack([bc, tf.cross(n, bc), n]), perm=[1, 2, 0])                     # [BATCH_SIZE, NUM_DIMS, 3 TRANS]
-                m = tf.reshape(tf.tile(m, [s[0], 1, 1]), s, name='m')                                    # [FRAG_SIZE, BATCH_SIZE, NUM_DIMS, 3 TRANS]
-            coord = tf.add(tf.squeeze(tf.matmul(m, tf.expand_dims(pt, 3)), axis=3), tri.c, name='coord') # [NUM_FRAGS/FRAG_SIZE, BATCH_SIZE, NUM_DIMS]
-            return coord
-        
-        # loop over FRAG_SIZE in NUM_FRAGS parallel fragments, sequentially generating the coordinates for each fragment across all batches
-        i = tf.constant(0)
-        s_padded = tf.shape(pt)[0] # FRAG_SIZE
-        coords_ta = tf.TensorArray(tf.float32, size=s_padded, tensor_array_name='coordinates_array')
-                    # FRAG_SIZE x [NUM_FRAGS, BATCH_SIZE, NUM_DIMENSIONS] 
-        
-        def loop_extend(i, tri, coords_ta): # FRAG_SIZE x [NUM_FRAGS, BATCH_SIZE, NUM_DIMENSIONS] 
-            coord = extend(tri, pt[i], True)
-            return [i + 1, Triplet(tri.b, tri.c, coord), coords_ta.write(i, coord)]
+    tris, coords_pretrans = fori_loop(0, pt.shape[0], loop_extend, coords)
+                                  # NUM_DIHEDRALS x [NUM_FRAGS, BATCH_SIZE, NUM_DIMENSIONS], 
+                                  # FRAG_SIZE x [NUM_FRAGS, BATCH_SIZE, NUM_DIMENSIONS] 
+    
+    # loop over NUM_FRAGS in reverse order, bringing all the downstream fragments in alignment with current fragment
+    coords_pretrans = np.transpose(coords_pretrans, perm=[1, 0, 2, 3]) # [NUM_FRAGS, FRAG_SIZE, BATCH_SIZE, NUM_DIMENSIONS]
+    n = coords_pretrans.shape[0] # NUM_FRAGS
 
-        _, tris, coords_pretrans_ta = tf.while_loop(lambda i, _1, _2: i < s_padded, loop_extend, [i, init_coords, coords_ta],
-                                                    parallel_iterations=parallel_iterations, swap_memory=swap_memory)
-                                      # NUM_DIHEDRALS x [NUM_FRAGS, BATCH_SIZE, NUM_DIMENSIONS], 
-                                      # FRAG_SIZE x [NUM_FRAGS, BATCH_SIZE, NUM_DIMENSIONS] 
-        
-        # loop over NUM_FRAGS in reverse order, bringing all the downstream fragments in alignment with current fragment
-        coords_pretrans = tf.transpose(coords_pretrans_ta.stack(), perm=[1, 0, 2, 3]) # [NUM_FRAGS, FRAG_SIZE, BATCH_SIZE, NUM_DIMENSIONS]
-        i = tf.shape(coords_pretrans)[0] # NUM_FRAGS
+    def loop_trans(j, coords):
+        i = (n - j) - 1
+        transformed_coords = extend(Triplet(*[di[i] for di in tris]), coords, False)
+        return [i - 1, np.concat([coords_pretrans[i], transformed_coords], 0)]
 
-        def loop_trans(i, coords):
-            transformed_coords = extend(Triplet(*[di[i] for di in tris]), coords, False)
-            return [i - 1, tf.concat([coords_pretrans[i], transformed_coords], 0)]
+    coords_trans = fori_loop(0, n, loop_trans, coords_pretrans[-1]) # [NUM_FRAGS x FRAG_SIZE, BATCH_SIZE, NUM_DIMENSIONS]
 
-        _, coords_trans = tf.while_loop(lambda i, _: i > -1, loop_trans, [i - 2, coords_pretrans[-1]],
-                                        parallel_iterations=parallel_iterations, swap_memory=swap_memory)
-                          # [NUM_FRAGS x FRAG_SIZE, BATCH_SIZE, NUM_DIMENSIONS]
+    # lose last atom and pad from the front to gain an atom ([0,0,0], consistent with init_mat), to maintain correct atom ordering
+    coords = np.pad(coords_trans[:s-1], [[1, 0], [0, 0], [0, 0]]) # [NUM_STEPS x NUM_DIHEDRALS, BATCH_SIZE, NUM_DIMENSIONS]
 
-        # lose last atom and pad from the front to gain an atom ([0,0,0], consistent with init_mat), to maintain correct atom ordering
-        coords = tf.pad(coords_trans[:s-1], [[1, 0], [0, 0], [0, 0]], name=scope) # [NUM_STEPS x NUM_DIHEDRALS, BATCH_SIZE, NUM_DIMENSIONS]
-
-        return coords
+    return coords
