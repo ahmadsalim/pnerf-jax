@@ -9,6 +9,7 @@ __license__ = "MIT"
 
 # Imports
 import jax.numpy as np
+import numpy as onp
 from jax.ops import index_update, index
 from jax.lax import fori_loop, dynamic_update_slice
 import collections
@@ -102,7 +103,7 @@ def point_to_coordinate(pt, num_fragments=6):
         if multi_m: # multiple fragments, one atom at a time. 
             m = np.transpose(np.stack([bc, np.cross(n, bc), n]), [1, 2, 3, 0])        # [NUM_FRAGS,   BATCH_SIZE, NUM_DIMS, 3 TRANS]
         else: # single fragment, reconstructed entirely at once.
-            s = np.pad(pt.shape, [[0, 1]], constant_values=3)                                    # FRAG_SIZE, BATCH_SIZE, NUM_DIMS, 3 TRANS
+            s = onp.pad(pt.shape, [[0, 1]], constant_values=3)                                    # FRAG_SIZE, BATCH_SIZE, NUM_DIMS, 3 TRANS
             m = np.transpose(np.stack([bc, np.cross(n, bc), n]), [1, 2, 0])                     # [BATCH_SIZE, NUM_DIMS, 3 TRANS]
             m = np.reshape(np.tile(m, [s[0], 1, 1]), s)                                    # [FRAG_SIZE, BATCH_SIZE, NUM_DIMS, 3 TRANS]
         coord = np.squeeze(np.matmul(m, np.expand_dims(pt, 3)), axis=3) + tri.c  # [NUM_FRAGS/FRAG_SIZE, BATCH_SIZE, NUM_DIMS]
